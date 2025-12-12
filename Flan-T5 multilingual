@@ -1,0 +1,105 @@
+import docx
+
+# ==============================
+# Cell 0 : Upload du fichier Word
+# ==============================
+from google.colab import files
+uploaded = files.upload()  # uploader le fichier Word depuis votre PC
+
+# Récupérer le nom du fichier uploadé
+filename = list(uploaded.keys())[0]
+print(f"Fichier uploadé : {filename}")
+
+# ==============================
+# Cell 1 : Installer les dépendances
+# ==============================
+!pip install transformers[torch] sentence-transformers faiss-cpu python-docx
+
+# ==============================
+# Cell 2 : Import des librairies
+# ==============================
+import torch
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from sentence_transformers import SentenceTransformer
+import faiss
+from docx import Document
+
+# Détecter le device
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("Using device:", device)
+
+# ==============================
+# Cell 3 : Charger le document Word
+# ==============================
+doc = Document("info_ONVA.docx")  # ton fichier uploadé
+text = "\n".join([para.text for para in doc.paragraphs if para.text.strip() != ""])
+print("Longueur du document :", len(text), "caractères")
+
+# ==============================
+# Cell 4 : Créer les passages pour RAG
+# ==============================
+import re
+
+# Découper en passages de ~150 mots
+words_per_passage = 150
+sentences = re.split(r'(?<=[.?!])\s+', text)
+passages = []
+current_passage = ""
+count = 0
+for sent in sentences:
+    count += len(sent.split())
+    current_passage += " " + sent
+    if count >= words_per_passage:
+        passages.append(current_passage.strip())
+        current_passage = ""
+        count = 0
+if current_passage:
+    passages.append(current_passage.strip())
+
+print("Nombre de passages :", len(passages))
+
+# ==============================
+# Cell 5 : Encodage des passages pour récupération (retriever)
+# ==============================
+embed_model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2').to(device)
+passage_embeddings = embed_model.encode(passages, convert_to_numpy=True, normalize_embeddings=True)
+
+# FAISS index
+dimension = passage_embeddings.shape[1]
+index = faiss.IndexFlatIP(dimension)
+index.add(passage_embeddings)
+print("FAISS index created with", index.ntotal, "passages")
+
+# ==============================
+# Cell 6 : Fonction pour récupérer les passages pertinents
+# ==============================
+def retrieve_passages(question, k=3):
+    q_emb = embed_model.encode([question], convert_to_numpy=True, normalize_embeddings=True)
+    D, I = index.search(q_emb, k)
+    return [passages[i] for i in I[0]]
+
+# ==============================
+# Cell 7 : Charger Flan-T5 multilingual
+# ==============================
+model_name = "google/flan-t5-large"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+flan_model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(device)
+
+# ==============================
+# Cell 8 : Fonction pour générer une réponse
+# ==============================
+def generate_answer(question, passages_retrieved, max_new_tokens=150):
+    context = " ".join(passages_retrieved)
+    input_text = (
+        f"Tu es un assistant expert. Réponds toujours en français en utilisant uniquement le contexte fourni.\n"
+        f"Contexte: {context}\nQuestion: {question}\nRéponse:"
+    )
+    inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=512).to(device)
+    outputs = flan_model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=True,
+        top_p=0.9,
+        temperature=0.7,
+    )
+    return tokenizer.decode(outputs[0], skip_special_tokens=True)
